@@ -48,28 +48,78 @@ For all other Windows VMs, using Receive Side Scaling (RSS) can reach higher max
 
 ## Linux virtual machines
 
-RSS is always enabled by default in a Linux Virtual Machine (VM) in Azure. Linux kernels released since October 2017 include new network optimizations options that enable a Linux VM to achieve higher network throughput.
+### Receive-Side Scaling (RSS) — enabled by default
 
-### Enable Azure Accelerated Networking for optimal throughput
+All Linux VMs on Azure have RSS enabled automatically. RSS distributes incoming network traffic processing across multiple CPU cores via hardware interrupt queues, preventing a single-core bottleneck and improving aggregate throughput. No configuration is required.
 
-Azure provides accelerated networking which can really improve network performance, latency, jitter. There are currently two different technologies that are used depending on the virtual machine size, [Mellanox](/azure/virtual-network/accelerated-networking-how-it-works) which is wide available and [MANA](/azure/virtual-network/accelerated-networking-mana-overview) which is developed by Microsoft.
+### Enable Accelerated Networking
 
-### Azure Tuned Kernels
+Accelerated Networking bypasses the host network stack by providing direct SR-IOV access to the physical NIC, delivering lower latency, higher packets-per-second, and reduced CPU utilization. Azure uses two underlying NIC technologies depending on the VM series:
 
-Some distributions such as Ubuntu (Canonical) and SUSE have [Azure tuned kernels](/azure/virtual-machines/linux/endorsed-distros#azure-tuned-kernels).
+| Technology | Driver | Availability |
+|---|---|---|
+| [Mellanox ConnectX SR-IOV](/azure/virtual-network/accelerated-networking-how-it-works) | `mlx4_en` / `mlx5_core` | Broadly available across most VM families |
+| [Microsoft Azure Network Adapter (MANA)](/azure/virtual-network/accelerated-networking-mana-overview) | `mana` | Newer VM families (Dv6, Ev6, etc.) |
 
-Use the following command to make sure that you're using the Azure kernel, which has usually the `azure` string in the naming.
+After enabling Accelerated Networking, apply these per-NIC optimizations:
+
+**Increase NIC ring buffer sizes (TX/RX)** — larger ring buffers reduce packet drops under burst traffic. Create `/etc/udev/rules.d/99-azure-ring-buffer.rules`:
+
+```plaintext
+# Accelerated interface (Mellanox / MANA)
+SUBSYSTEM=="net", DRIVERS=="hv_pci", ACTION=="add", RUN+="/usr/sbin/ethtool -G $env{INTERFACE} rx 1024 tx 1024"
+
+# Synthetic interface (hv_netvsc)
+SUBSYSTEM=="net", DRIVERS=="hv_netvsc*", ACTION=="add", RUN+="/usr/sbin/ethtool -G $env{INTERFACE} rx 1024 tx 1024"
+```
+
+**Set the `fq` (Fair Queue) qdisc** — `fq` paces packets per-flow and integrates with BBR congestion control. Add to `/etc/sysctl.d/99-azure-qdisc.conf`:
+
+```plaintext
+net.core.default_qdisc = fq
+```
+
+Apply via udev to ensure it persists across interface hotplug. Create `/etc/udev/rules.d/99-azure-qdisc.rules`:
+
+```plaintext
+ACTION=="add|change", SUBSYSTEM=="net", KERNEL=="enP*", PROGRAM="/sbin/tc qdisc replace dev \$env{INTERFACE} root noqueue"
+ACTION=="add|change", SUBSYSTEM=="net", KERNEL=="eth*", PROGRAM="/sbin/tc qdisc replace dev \$env{INTERFACE} root fq"
+```
+
+**Adjust IRQ balancing** — for latency-sensitive or CPU-pinned workloads, exclude specific cores from IRQ scheduling by setting a hex CPU mask in `/etc/default/irqbalance`. Example excluding CPUs 8–15:
+
+```bash
+IRQBALANCE_BANNED_CPULIST=0000ff00
+```
+
+Refer to the [irqbalance man page](https://manpages.debian.org/testing/irqbalance/irqbalance.1.en.html#IRQBALANCE_BANNED_CPUS) and [Red Hat IRQ binding guide](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux_for_real_time/7/html/tuning_guide/interrupt_and_process_binding) for mask calculation.
+
+### Use an Azure-Tuned Kernel
+
+Distributions such as Ubuntu (Canonical) and SUSE ship [Azure-tuned kernels](/azure/virtual-machines/linux/endorsed-distros#azure-tuned-kernels) that include networking stack optimizations, pre-configured sysctl defaults, and Hyper-V/MANA driver patches. Verify your running kernel contains the `azure` suffix:
 
 ```bash
 uname -r
 
-#sample output on Azure kernel on a Ubuntu Linux VM
+# Expected output on an Azure-tuned Ubuntu kernel
 6.8.0-1017-azure
 ```
 
-### Other Linux distributions
+### Use Kernel Version 4.19 or Newer
 
-Most modern distributions have significant improvements with newer kernels. Check the current kernel version to make sure that you're running a kernel that is newer than 4.19, which includes some great improvements in networking, for example support for the *BBR Congestion-Based Congestion Control*.
+Kernels ≥ 4.19 include critical networking improvements: BBR (Bottleneck Bandwidth and Round-trip propagation time) congestion control, improved TCP pacing, and better NAPI scheduling. If your VM runs an older kernel, upgrading significantly improves throughput and consistency, especially for large cross-region transfers (1 GB–50 GB+).
+
+Verify your kernel version:
+
+```bash
+uname -r
+```
+
+Enable BBR on kernels ≥ 4.19 by adding to `/etc/sysctl.d/99-azure-congestion-control.conf`:
+
+```plaintext
+net.ipv4.tcp_congestion_control = bbr
+```
 
 ## Achieving consistent transfer speeds in Linux VMs in Azure
 
